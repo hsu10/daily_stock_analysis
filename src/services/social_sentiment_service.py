@@ -70,7 +70,12 @@ class SocialSentimentService:
     _TRENDING_CACHE_TTL = 600  # 10 minutes
 
     def __init__(self, api_key: Optional[str] = None, api_url: str = "https://api.adanos.org"):
-        self._api_key = (api_key or "").strip() or None
+        # Supports one key or several comma-separated keys ("key1,key2").
+        # Keys are used one at a time; on auth/quota errors the next key is tried.
+        self._api_keys: List[str] = [k.strip() for k in (api_key or "").split(",") if k.strip()]
+        self._api_key = self._api_keys[0] if self._api_keys else None
+        self._key_index = 0
+        self._key_lock = threading.Lock()
         self._api_url = (api_url or "https://api.adanos.org").rstrip("/")
         # Simple in-memory cache: {"key": (timestamp, data)}
         self._cache: Dict[str, tuple] = {}
@@ -83,23 +88,52 @@ class SocialSentimentService:
 
     @property
     def _headers(self) -> Dict[str, str]:
-        return {"X-API-Key": self._api_key or "", "Accept": "application/json"}
+        return self._headers_for(self._api_key)
+
+    @staticmethod
+    def _headers_for(key: Optional[str]) -> Dict[str, str]:
+        return {"X-API-Key": key or "", "Accept": "application/json"}
 
     # ------------------------------------------------------------------
     # API calls
     # ------------------------------------------------------------------
 
+    # HTTP statuses that mean "this key cannot be used right now" -> try the next key
+    _KEY_FAILOVER_STATUSES = (401, 402, 403, 429)
+
     def _fetch_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
-        """Fetch JSON from API, return None on any error."""
-        try:
-            resp = _get_with_retry(url, headers=self._headers, params=params)
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("Social sentiment API %s returned %s", url, resp.status_code)
-        except _TRANSIENT_EXCEPTIONS as e:
-            logger.warning("Social sentiment API %s network error: %s", url, e)
-        except Exception as e:
-            logger.warning("Social sentiment API %s unexpected error: %s", url, e)
+        """Fetch JSON from API, return None on any error.
+
+        With several keys configured, the current key is used until it returns an
+        auth/quota error, then the next key is tried (and kept for later calls).
+        """
+        if not self._api_keys:
+            return None
+        with self._key_lock:
+            start = self._key_index
+        total = len(self._api_keys)
+        for offset in range(total):
+            idx = (start + offset) % total
+            try:
+                resp = _get_with_retry(url, headers=self._headers_for(self._api_keys[idx]), params=params)
+                if resp.status_code == 200:
+                    if idx != start:
+                        with self._key_lock:
+                            self._key_index = idx
+                            self._api_key = self._api_keys[idx]
+                    return resp.json()
+                if resp.status_code in self._KEY_FAILOVER_STATUSES and offset < total - 1:
+                    logger.warning(
+                        "Social sentiment API key #%d returned %s, switching to key #%d",
+                        idx + 1, resp.status_code, (idx + 1) % total + 1,
+                    )
+                    continue
+                logger.warning("Social sentiment API %s returned %s", url, resp.status_code)
+            except _TRANSIENT_EXCEPTIONS as e:
+                logger.warning("Social sentiment API %s network error: %s", url, e)
+            except Exception as e:
+                logger.warning("Social sentiment API %s unexpected error: %s", url, e)
+            return None
         return None
 
     @classmethod
